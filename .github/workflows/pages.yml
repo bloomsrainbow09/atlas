@@ -76,24 +76,42 @@ jobs:
           touch dist/.nojekyll
           echo "built $(du -sh dist | cut -f1), $(find dist -type f | wc -l) files"
 
-      - name: Fail if the API address did not make it into the bundle
+      - name: Check the bundle before publishing it
         working-directory: app/frontend
-        # The failure this prevents: a bundle that looks fine, loads fine, and
-        # fetches /api/health from github.io -- a 404 that the UI reports as a
-        # backend that is down. Checked here because it is invisible in the
-        # artifact and obvious in grep.
+        # Two failures this catches, both of which produce a page that loads
+        # and then misbehaves rather than an error anyone can read:
+        #   * the API address missing, so the app fetches /api/health from
+        #     github.io, gets a 404, and reports a backend that is down;
+        #   * a credential inlined into a bundle that is served publicly.
+        # Diagnostics are printed unconditionally, because the first version of
+        # this step failed with nothing but its own exit code to go on.
         run: |
-          set -euo pipefail
-          if ! grep -rqF "$VITE_API_BASE" dist/assets/*.js; then
+          set -uo pipefail
+          echo "VITE_API_BASE=[${VITE_API_BASE:-<unset>}]"
+          echo "VITE_BASE=[${VITE_BASE:-<unset>}]"
+          echo "--- dist ---"
+          ls -la dist | head -20
+          echo "--- dist/assets (js only) ---"
+          ls -la dist/assets/*.js || echo "  NO JS IN dist/assets"
+          echo "--- index.html asset refs ---"
+          grep -oE '(src|href)="[^"]*"' dist/index.html | head -10 || true
+
+          fail=0
+          if grep -rqF -- "$VITE_API_BASE" dist/assets/ ; then
+            echo "OK: api base is in the bundle"
+          else
             echo "::error::VITE_API_BASE ($VITE_API_BASE) is not in the bundle"
-            exit 1
+            fail=1
           fi
-          echo "api base present in the bundle"
-          if grep -rqE 'scrypt\$|ATLAS_TOKEN_SECRET|ATLAS_PASSWORD_HASH' dist; then
-            echo "::error::a credential reached the bundle"
-            exit 1
+
+          if hits=$(grep -rlE 'scrypt\$[0-9]|ATLAS_TOKEN_SECRET|ATLAS_PASSWORD_HASH' dist 2>/dev/null); then
+            echo "::error::a credential reached the bundle: $hits"
+            fail=1
+          else
+            echo "OK: no credential in the bundle"
           fi
-          echo "no credential in the bundle"
+
+          exit $fail
 
       - uses: actions/upload-pages-artifact@v3
         with:
