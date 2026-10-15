@@ -1,0 +1,110 @@
+# Build the Atlas frontend and publish it to GitHub Pages.
+#
+# This lives on the public `bloomsrainbow09/atlas` repository rather than in
+# the private application repository, for one reason: Pages on a public repo is
+# free and unmetered, and publishing to it needs nothing but this repository's
+# own GITHUB_TOKEN. Deploying from the private repo would need a token with
+# write access to another account's repository -- a credential that does not
+# otherwise exist in this deployment.
+#
+# The application code is checked out with the same read-only deploy key the
+# runner uses. A deploy key is per-repository on the *source*, so one key
+# serves both consumers.
+name: pages
+
+on:
+  workflow_dispatch:
+  # Rebuilt on a schedule rather than on every application commit, because this
+  # repository cannot see commits on the private one. A manual run is the fast
+  # path after a frontend change; the weekly tick is the safety net so the
+  # published bundle cannot drift indefinitely from main.
+  schedule:
+    - cron: '41 5 * * 1'
+
+# The deploy-pages action needs these two, and nothing else here does.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never two deploys at once, and let a newer one win: a half-finished Pages
+# deployment serves a bundle whose assets do not match its index.html.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  # Where the browser reaches the API: Caddy on the EC2, with a Let's Encrypt
+  # certificate for an sslip.io name. Not a relative path -- the bundle is on
+  # github.io and the API is not.
+  VITE_API_BASE: https://3-236-111-101.sslip.io:47991
+  # Pages serves this repo at /atlas/, so every asset URL needs that prefix.
+  VITE_BASE: /atlas/
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the application
+        uses: actions/checkout@v4
+        with:
+          repository: prarthanadoshi7/atlas-search
+          ssh-key: ${{ secrets.ATLAS_REPO_DEPLOY_KEY }}
+          path: app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Install
+        working-directory: app/frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: app/frontend
+        run: |
+          set -euo pipefail
+          npm run build
+          # Pages has no SPA rewrite. A copy of index.html at 404.html makes a
+          # deep link like /atlas/person/123 render the app instead of Pages'
+          # own 404 -- which is what makes a shared search URL work at all.
+          cp dist/index.html dist/404.html
+          # Jekyll would otherwise swallow any asset whose name starts with an
+          # underscore, silently.
+          touch dist/.nojekyll
+          echo "built $(du -sh dist | cut -f1), $(find dist -type f | wc -l) files"
+
+      - name: Fail if the API address did not make it into the bundle
+        working-directory: app/frontend
+        # The failure this prevents: a bundle that looks fine, loads fine, and
+        # fetches /api/health from github.io -- a 404 that the UI reports as a
+        # backend that is down. Checked here because it is invisible in the
+        # artifact and obvious in grep.
+        run: |
+          set -euo pipefail
+          if ! grep -rqF "$VITE_API_BASE" dist/assets/*.js; then
+            echo "::error::VITE_API_BASE ($VITE_API_BASE) is not in the bundle"
+            exit 1
+          fi
+          echo "api base present in the bundle"
+          if grep -rqE 'scrypt\$|ATLAS_TOKEN_SECRET|ATLAS_PASSWORD_HASH' dist; then
+            echo "::error::a credential reached the bundle"
+            exit 1
+          fi
+          echo "no credential in the bundle"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: app/frontend/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
